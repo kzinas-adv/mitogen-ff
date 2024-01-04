@@ -185,8 +185,8 @@ def _setup_responder(responder):
     Configure :class:`mitogen.master.ModuleResponder` to only permit
     certain packages, and to generate custom responses for certain modules.
     """
-    responder.whitelist_prefix('ansible')
-    responder.whitelist_prefix('ansible_mitogen')
+    #responder.whitelist_prefix('ansible')
+    #responder.whitelist_prefix('ansible_mitogen')
 
     # Ansible 2.3 is compatible with Python 2.4 targets, however
     # ansible/__init__.py is not. Instead, executor/module_common.py writes
@@ -285,7 +285,13 @@ class Broker(mitogen.master.Broker):
     the exuberant syscall expense of EpollPoller, so override it and restore
     the poll() poller.
     """
-    poller_class = mitogen.core.Poller
+    # poller_class = mitogen.core.Poller
+    pass
+
+    if mitogen.parent.PollPoller.SUPPORTED:
+        poller_class = mitogen.parent.PollPoller
+    else:
+        poller_class = mitogen.core.Poller
 
 
 class Binding(object):

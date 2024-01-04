@@ -58,9 +58,17 @@ import warnings
 import weakref
 import zlib
 
-# Python >3.7 deprecated the imp module.
-warnings.filterwarnings('ignore', message='the imp module is deprecated')
-import imp
+has_importlib = False
+try:
+    import importlib
+    # importlib.util is available in importlib package, but sometimes
+    # it is not. This was observed to vary, despite exactly same Python
+    # version installed on different machines.
+    import importlib.util
+    from importlib.machinery import ModuleSpec
+    has_importlib = True
+except:
+    has_importlib = False
 
 # Absolute imports for <2.5.
 select = __import__('select')
@@ -94,6 +102,15 @@ try:
     ModuleNotFoundError
 except NameError:
     ModuleNotFoundError = ImportError
+
+has_imp = False
+try:
+    import imp
+    has_imp = True
+except ModuleNotFoundError:
+    has_imp = False
+
+assert has_imp or has_importlib
 
 # TODO: usage of 'import' after setting __name__, but before fixing up
 # sys.modules generates a warning. This happens when profiling = True.
@@ -298,6 +315,19 @@ class Kwargs(dict):
 
     def __reduce__(self):
         return (Kwargs, (dict(self),))
+
+
+AnsibleUnsafeText = None
+
+def lazy_AnsibleUnsafeText():
+    global AnsibleUnsafeText
+    if AnsibleUnsafeText is not None:
+        return AnsibleUnsafeText
+    mod = __import__("ansible.utils.unsafe_proxy", fromlist=("AnsibleUnsafeText",))
+    AnsibleUnsafeText = getattr(mod, "AnsibleUnsafeText")
+    assert type(AnsibleUnsafeText) is type, f"AnsibleUnsafeText {AnsibleUnsafeText} is not a type"
+    assert callable(AnsibleUnsafeText), f"AnsibleUnsafeText {AnsibleUnsafeText} is not callable"
+    return AnsibleUnsafeText
 
 
 class CallError(Error):
@@ -767,6 +797,9 @@ else:
     _Unpickler = pickle.Unpickler
 
 
+PICKLE_PROTOCOL = 2
+
+
 class Message(object):
     """
     Messages are the fundamental unit of communication, comprising fields from
@@ -860,6 +893,8 @@ class Message(object):
                 return Secret
             elif func == 'Kwargs':
                 return Kwargs
+        elif module == 'ansible.utils.unsafe_proxy' and func == 'AnsibleUnsafeText':
+            return lazy_AnsibleUnsafeText()
         elif module == '_codecs' and func == 'encode':
             return self._unpickle_bytes
         elif module == '__builtin__' and func == 'bytes':
@@ -895,10 +930,10 @@ class Message(object):
         """
         self = cls(**kwargs)
         try:
-            self.data = pickle__dumps(obj, protocol=2)
+            self.data = pickle__dumps(obj, protocol=PICKLE_PROTOCOL)
         except pickle.PicklingError:
             e = sys.exc_info()[1]
-            self.data = pickle__dumps(CallError(e), protocol=2)
+            self.data = pickle__dumps(CallError(e), protocol=PICKLE_PROTOCOL)
         return self
 
     def reply(self, msg, router=None, **kwargs):
@@ -965,6 +1000,7 @@ class Message(object):
                 try:
                     obj = unpickler.load()
                 except:
+                    LOG.exception("unpickler.load exception")
                     LOG.error('raw pickle was: %r', self.data)
                     raise
                 self._unpickled = obj
@@ -1360,17 +1396,44 @@ class Importer(object):
         if fullname == '__main__':
             raise ModuleNotFoundError()
 
+        assert hasattr(_tls, 'running')
+
         parent, _, modname = str_rpartition(fullname, '.')
         if parent:
             path = sys.modules[parent].__path__
         else:
             path = None
 
+        if has_importlib:
+            # Python 3.4+
+            if hasattr(importlib.util, 'find_spec'):
+                # spec = importlib.util.find_spec(modname, package=parent or None)
+                spec = importlib.util.find_spec(fullname)
+                if spec:
+                    return  # Good
+                else:
+                    # raise ImportError()
+                    raise ModuleNotFoundError()
+
+            # Python 3.3 and earlier
+            loader = importlib.find_loader(modname, path)
+            if loader:
+                return  # Good
+            else:
+                # raise ImportError()
+                raise ModuleNotFoundError()
+
+        assert has_imp
         fp, pathname, description = imp.find_module(modname, path)
         if fp:
             fp.close()
 
+        return  # Good
+
     def find_module(self, fullname, path=None):
+        _vv and self._log.debug('')
+        _vv and self._log.debug('%r.find_module %r %r called', self, fullname, path)
+
         """
         Return a loader (ourself) or None, for the module with fullname.
 
@@ -1378,9 +1441,12 @@ class Importer(object):
         Deprecrated in Python 3.4+, replaced by find_spec().
         Raises ImportWarning in Python 3.10+.
 
-        fullname    A (fully qualified?) module name, e.g. "os.path".
+        fullname    A fully qualified module name, e.g. "os.path".
         path        __path__ of parent packge. None for a top level module.
         """
+
+        # This is to break recursion to itself due to the use of
+        # module import attempt via self.builtin_find_module
         if hasattr(_tls, 'running'):
             return None
 
@@ -1406,14 +1472,27 @@ class Importer(object):
                 if any(fullname.startswith(s) for s in self.whitelist):
                     return self
 
+            if fullname.startswith("ansible") or fullname.startswith("ansible_mitogen"):
+                return self
+
+            _vv and self._log.debug('checking if %r is available locally', fullname)
+
             try:
                 self.builtin_find_module(fullname)
                 _vv and self._log.debug('%r is available locally', fullname)
+                return None
             except ImportError:
                 _vv and self._log.debug('we will try to load %r', fullname)
                 return self
         finally:
             del _tls.running
+
+    def find_spec(self, fullname, path, target=None):
+        loader = self.find_module(fullname, path=path)
+        if loader is None:
+            return None
+
+        return ModuleSpec(fullname, self, loader_state={})
 
     blacklisted_msg = (
         '%r is present in the Mitogen importer blacklist, therefore this '
@@ -1460,16 +1539,18 @@ class Importer(object):
             return
 
         tup = msg.unpickle()
-        fullname = tup[0]
+        fullname, pkg_present, filename, payload = tup[0], tup[1], tup[2], tup[3]
         _v and self._log.debug('received %s', fullname)
 
         self._lock.acquire()
         try:
+            # Note: We cache not only succesfull loads, but also failed loads
+            # (i.e. no such module), in which case tup[2] (filename) will be None.
             self._cache[fullname] = tup
-            if tup[2] is not None and PY24:
+            if filename is not None and PY24:
                 self._update_linecache(
-                    path='master:' + tup[2],
-                    data=zlib.decompress(tup[3])
+                    path='master:' + filename,
+                    data=zlib.decompress(payload)
                 )
             callbacks = self._callbacks.pop(fullname, [])
         finally:
@@ -1508,6 +1589,27 @@ class Importer(object):
         Implements importlib.abc.Loader.load_module().
         Deprecated in Python 3.4+, replaced by create_module() & exec_module().
         """
+
+        _vv and self._log.debug('%r load_module %r called', self, fullname)
+
+        # spec = ModuleSpec(fullname, self)
+        # return importlib.util.module_from_spec(spec)
+
+        mod = spec.loader.create_module(fullname)
+        assert spec.loader is self
+        spec.loader.exec_module(mod)
+        return mod
+
+    def create_module(self, spec):
+        # Note: Import machinery only uses this with importlib faciilties with
+        # Python 3.3+, but to avoid code duplication, we also use that in older
+        # Python version as we call it in `self.load_module`. So one still
+        # needs to check for `has_importlib` in few places.
+
+        _vv and self._log.debug('%r create_module %r called', self, spec)
+
+        fullname = spec.name
+
         fullname = to_text(fullname)
         _v and self._log.debug('requesting %s', fullname)
         self._refuse_imports(fullname)
@@ -1521,7 +1623,15 @@ class Importer(object):
             raise ModuleNotFoundError(self.absent_msg % (fullname,))
 
         pkg_present = ret[1]
-        mod = sys.modules.setdefault(fullname, imp.new_module(fullname))
+
+        if has_importlib:
+            import types
+            mod = types.ModuleType(fullname)
+        else:
+            assert has_imp
+            mod = imp.new_module(fullname)
+
+        mod = sys.modules.setdefault(fullname, mod)
         mod.__file__ = self.get_filename(fullname)
         mod.__loader__ = self
         if pkg_present is not None:  # it's a package.
@@ -1535,7 +1645,23 @@ class Importer(object):
             # 2.x requires __package__ to be exactly a string.
             mod.__package__, _ = encodings.utf_8.encode(mod.__package__)
 
-        source = self.get_source(fullname)
+        mod.__spec__ = spec
+
+        # This can be arbitrary (i.e. to pass from find_spec, or to exec_module)
+        spec.loader_state = {"source": self.get_source(fullname)}
+
+        return mod
+
+    def exec_module(self, mod):
+        # Note:  Similarly this is only used in Python 3.3, but due our
+        # implementation of self.load_module this can also be called in older
+        # Pythons, including possibly Python 2.
+
+        _vv and self._log.debug('%r exec_module %r called', self, mod)
+
+        fullname = mod.__name__
+        # source = self.get_source(fullname)
+        source = mod.__spec__.loader_state["source"]
         try:
             code = compile(source, mod.__file__, 'exec', 0, 1)
         except SyntaxError:
@@ -1543,6 +1669,7 @@ class Importer(object):
             raise
 
         if PY3:
+            _vv and self._log.debug('%r exec_module exec code %r vars %r', self, code, vars(mod))
             exec(code, vars(mod))
         else:
             exec('exec code in vars(mod)')
@@ -3682,6 +3809,9 @@ class Dispatcher(object):
         _v and LOG.debug('%r: dispatching %r', self, data)
 
         chain_id, modname, klass, func, args, kwargs = data
+
+        _v and LOG.debug('%r: before import_module our sys.modules = %r', self, sys.modules)
+
         obj = import_module(modname)
         if klass:
             obj = getattr(obj, klass)
@@ -3921,7 +4051,13 @@ class ExternalContext(object):
 
     def _setup_package(self):
         global mitogen
-        mitogen = imp.new_module('mitogen')
+
+        if not has_imp:
+            import types
+            mitogen = types.ModuleType('mitogen')
+        else:
+            mitogen = imp.new_module('mitogen')
+
         mitogen.__package__ = 'mitogen'
         mitogen.__path__ = []
         mitogen.__loader__ = self.importer

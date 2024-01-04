@@ -75,6 +75,7 @@ import ansible_mitogen.loaders
 
 class Connection(ansible_mitogen.connection.Connection):
     transport = 'ssh'
+    # It actually returns a namedtuple 'ansible.plugins.loader.get_with_context_result'
     vanilla_class = ansible_mitogen.loaders.connection_loader__get(
         'ssh',
         class_only=True,
@@ -84,4 +85,5 @@ class Connection(ansible_mitogen.connection.Connection):
     def _create_control_path(*args, **kwargs):
         """Forward _create_control_path() to the implementation in ssh.py."""
         # https://github.com/dw/mitogen/issues/342
+        # print("mitogen_ssh.Connection._create_control_path", type(vanilla_class))
         return Connection.vanilla_class._create_control_path(*args, **kwargs)

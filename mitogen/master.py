@@ -239,8 +239,12 @@ if mitogen.is_master:
     mitogen.parent._get_core_source = _get_core_source
 
 
+BUILD_TUPLE = dis.opname.index('BUILD_TUPLE')
 LOAD_CONST = dis.opname.index('LOAD_CONST')
+LOAD_NAME = dis.opname.index('LOAD_NAME')
 IMPORT_NAME = dis.opname.index('IMPORT_NAME')
+if sys.version_info >= (3, 0):
+    LOAD_BUILD_CLASS = dis.opname.index('LOAD_BUILD_CLASS')
 
 
 def _getarg(nextb, c):
@@ -296,14 +300,21 @@ def scan_code_imports(co):
         return
 
     if sys.version_info >= (2, 5):
-        for oparg1, oparg2, (op3, arg3) in izip(opit, opit2, opit3):
-            if op3 == IMPORT_NAME:
-                op2, arg2 = oparg2
-                op1, arg1 = oparg1
-                if op1 == op2 == LOAD_CONST:
+        for (op1, arg1), (op2, arg2), (op3, arg3) in izip(opit, opit2, opit3):
+            if op3 == IMPORT_NAME and op1 == op2 == LOAD_CONST:
                     yield (co.co_consts[arg1],
                            co.co_names[arg3],
                            co.co_consts[arg2] or ())
+
+            # Scan defined classes for imports
+            if sys.version_info < (3, 0):
+                if op1 == LOAD_NAME and op2 == BUILD_TUPLE and op3 == LOAD_CONST and isinstance(co.co_consts[arg3],types.CodeType):
+                    for level, modname, namelist in scan_code_imports(co.co_consts[arg3]):
+                        yield (level, modname, namelist)
+            if sys.version_info >= (3, 0):
+                if op1 == LOAD_BUILD_CLASS and op2 == LOAD_CONST and isinstance(co.co_consts[arg2],types.CodeType):
+                    for level, modname, namelist in scan_code_imports(co.co_consts[arg2]):
+                        yield (level, modname, namelist)
     else:
         # Python 2.4 did not yet have 'level', so stack format differs.
         for oparg1, (op2, arg2) in izip(opit, opit2):
@@ -854,14 +865,18 @@ class ModuleFinder(object):
         if tup:
             return tup
 
+        # LOG.debug('Searching for %s', fullname)
+
         for method in self.get_module_methods:
             tup = method.find(fullname)
             if tup:
-                #LOG.debug('%r returned %r', method, tup)
+                # LOG.debug('method=%r returned path=%r source=%r...%d is_pkg=%r', method, tup[0], tup[1][0:30], len(tup[1]), tup[2])
                 break
         else:
             tup = None, None, None
             LOG.debug('get_module_source(%r): cannot find source', fullname)
+
+        # LOG.debug('  ')
 
         self._found_cache[fullname] = tup
         return tup
